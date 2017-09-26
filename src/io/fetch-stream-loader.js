@@ -31,9 +31,12 @@ class FetchStreamLoader extends BaseLoader {
 
     static isSupported() {
         try {
-            // fetch + stream is broken on Microsoft Edge. Disable for now.
+            // fetch + stream is broken on Microsoft Edge. Disable before build 15048.
             // see https://developer.microsoft.com/en-us/microsoft-edge/platform/issues/8196907/
-            return (self.fetch && self.ReadableStream && !Browser.msedge);
+            // Fixed in Jan 10, 2017. Build 15048+ removed from blacklist.
+            let isWorkWellEdge = Browser.msedge && Browser.version.minor >= 15048;
+            let browserNotBlacklisted = Browser.msedge ? isWorkWellEdge : true;
+            return (self.fetch && self.ReadableStream && browserNotBlacklisted);
         } catch (e) {
             return false;
         }
@@ -85,7 +88,10 @@ class FetchStreamLoader extends BaseLoader {
             method: 'GET',
             headers: headers,
             mode: 'cors',
-            cache: 'default'
+            cache: 'default',
+            // The default policy of Fetch API in the whatwg standard
+            // Safari incorrectly indicates 'no-referrer' as default policy, fuck it
+            referrerPolicy: 'no-referrer-when-downgrade'
         };
 
         // cors is enabled by default
@@ -97,6 +103,11 @@ class FetchStreamLoader extends BaseLoader {
         // withCredentials is disabled by default
         if (dataSource.withCredentials) {
             params.credentials = 'include';
+        }
+
+        // referrerPolicy from config
+        if (dataSource.referrerPolicy) {
+            params.referrerPolicy = dataSource.referrerPolicy;
         }
 
         this._status = LoaderStatus.kConnecting;
@@ -171,9 +182,16 @@ class FetchStreamLoader extends BaseLoader {
                     this._onDataArrival(chunk, byteStart, this._receivedLength);
                 }
 
-                return this._pump(reader);
+                this._pump(reader);
             }
         }).catch((e) => {
+            if (e.code === 11 && Browser.msedge) {  // InvalidStateError on Microsoft Edge
+                // Workaround: Edge may throw InvalidStateError after ReadableStreamReader.cancel() call
+                // Ignore the unknown exception.
+                // Related issue: https://developer.microsoft.com/en-us/microsoft-edge/platform/issues/11265202/
+                return;
+            }
+
             this._status = LoaderStatus.kError;
             let type = 0;
             let info = null;

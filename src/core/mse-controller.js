@@ -26,10 +26,16 @@ import {IllegalStateException} from '../utils/exception.js';
 // Media Source Extensions controller
 class MSEController {
 
-    constructor() {
+    constructor(config) {
         this.TAG = 'MSEController';
 
+        this._config = config;
         this._emitter = new EventEmitter();
+
+        if (this._config.isLive && this._config.autoCleanupSourceBuffer == undefined) {
+            // For live stream, do auto cleanup by default
+            this._config.autoCleanupSourceBuffer = true;
+        }
 
         this.e = {
             onSourceOpen: this._onSourceOpen.bind(this),
@@ -45,6 +51,9 @@ class MSEController {
 
         this._isBufferFull = false;
         this._hasPendingEos = false;
+
+        this._requireSetMediaDuration = false;
+        this._pendingMediaDuration = 0;
 
         this._pendingSourceBufferInit = [];
         this._mimeTypes = {
@@ -162,7 +171,11 @@ class MSEController {
         }
 
         let is = initSegment;
-        let mimeType = `${is.container};codecs=${is.codec}`;
+        let mimeType = `${is.container}`;
+        if (is.codec && is.codec.length > 0) {
+            mimeType += `;codecs=${is.codec}`;
+        }
+
         let firstInitSegment = false;
 
         Log.v(this.TAG, 'Received Initialization Segment, mimeType: ' + mimeType);
@@ -195,11 +208,22 @@ class MSEController {
                 this._doAppendSegments();
             }
         }
+        if (Browser.safari && is.container === 'audio/mpeg' && is.mediaDuration > 0) {
+            // 'audio/mpeg' track under Safari may cause MediaElement's duration to be NaN
+            // Manually correct MediaSource.duration to make progress bar seekable, and report right duration
+            this._requireSetMediaDuration = true;
+            this._pendingMediaDuration = is.mediaDuration / 1000;  // in seconds
+            this._updateMediaSourceDuration();
+        }
     }
 
     appendMediaSegment(mediaSegment) {
         let ms = mediaSegment;
         this._pendingSegments[ms.type].push(ms);
+
+        if (this._config.autoCleanupSourceBuffer && this._needCleanupSourceBuffer()) {
+            this._doCleanupSourceBuffer();
+        }
 
         let sb = this._sourceBuffers[ms.type];
         if (sb && !sb.updating && !this._hasPendingRemoveRanges()) {
@@ -293,6 +317,81 @@ class MSEController {
         return this._idrList.getLastSyncPointBeforeDts(dts);
     }
 
+    _needCleanupSourceBuffer() {
+        if (!this._config.autoCleanupSourceBuffer) {
+            return false;
+        }
+
+        let currentTime = this._mediaElement.currentTime;
+
+        for (let type in this._sourceBuffers) {
+            let sb = this._sourceBuffers[type];
+            if (sb) {
+                let buffered = sb.buffered;
+                if (buffered.length >= 1) {
+                    if (currentTime - buffered.start(0) >= this._config.autoCleanupMaxBackwardDuration) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    _doCleanupSourceBuffer() {
+        let currentTime = this._mediaElement.currentTime;
+
+        for (let type in this._sourceBuffers) {
+            let sb = this._sourceBuffers[type];
+            if (sb) {
+                let buffered = sb.buffered;
+                let doRemove = false;
+
+                for (let i = 0; i < buffered.length; i++) {
+                    let start = buffered.start(i);
+                    let end = buffered.end(i);
+
+                    if (start <= currentTime && currentTime < end + 3) {  // padding 3 seconds
+                        if (currentTime - start >= this._config.autoCleanupMaxBackwardDuration) {
+                            doRemove = true;
+                            let removeEnd = currentTime - this._config.autoCleanupMinBackwardDuration;
+                            this._pendingRemoveRanges[type].push({start: start, end: removeEnd});
+                        }
+                    } else if (end < currentTime) {
+                        doRemove = true;
+                        this._pendingRemoveRanges[type].push({start: start, end: end});
+                    }
+                }
+
+                if (doRemove && !sb.updating) {
+                    this._doRemoveRanges();
+                }
+            }
+        }
+    }
+
+    _updateMediaSourceDuration() {
+        let sb = this._sourceBuffers;
+        if (this._mediaElement.readyState === 0 || this._mediaSource.readyState !== 'open') {
+            return;
+        }
+        if ((sb.video && sb.video.updating) || (sb.audio && sb.audio.updating)) {
+            return;
+        }
+
+        let current = this._mediaSource.duration;
+        let target = this._pendingMediaDuration;
+
+        if (target > 0 && (isNaN(current) || target > current)) {
+            Log.v(this.TAG, `Update MediaSource duration from ${current} to ${target}`);
+            this._mediaSource.duration = target;
+        }
+
+        this._requireSetMediaDuration = false;
+        this._pendingMediaDuration = 0;
+    }
+
     _doRemoveRanges() {
         for (let type in this._pendingRemoveRanges) {
             if (!this._sourceBuffers[type] || this._sourceBuffers[type].updating) {
@@ -314,8 +413,29 @@ class MSEController {
             if (!this._sourceBuffers[type] || this._sourceBuffers[type].updating) {
                 continue;
             }
+
             if (pendingSegments[type].length > 0) {
                 let segment = pendingSegments[type].shift();
+
+                if (segment.timestampOffset) {
+                    // For MPEG audio stream in MSE, if unbuffered-seeking occurred
+                    // We need explicitly set timestampOffset to the desired point in timeline for mpeg SourceBuffer.
+                    let currentOffset = this._sourceBuffers[type].timestampOffset;
+                    let targetOffset = segment.timestampOffset / 1000;  // in seconds
+
+                    let delta = Math.abs(currentOffset - targetOffset);
+                    if (delta > 0.1) {  // If time delta > 100ms
+                        Log.v(this.TAG, `Update MPEG audio timestampOffset from ${currentOffset} to ${targetOffset}`);
+                        this._sourceBuffers[type].timestampOffset = targetOffset;
+                    }
+                    delete segment.timestampOffset;
+                }
+
+                if (!segment.data || segment.data.byteLength === 0) {
+                    // Ignore empty buffer
+                    continue;
+                }
+
                 try {
                     this._sourceBuffers[type].appendBuffer(segment.data);
                     this._isBufferFull = false;
@@ -392,7 +512,9 @@ class MSEController {
     }
 
     _onSourceBufferUpdateEnd() {
-        if (this._hasPendingRemoveRanges()) {
+        if (this._requireSetMediaDuration) {
+            this._updateMediaSourceDuration();
+        } else if (this._hasPendingRemoveRanges()) {
             this._doRemoveRanges();
         } else if (this._hasPendingSegments()) {
             this._doAppendSegments();
