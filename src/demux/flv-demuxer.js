@@ -127,17 +127,21 @@ class FLVDemuxer {
     }
 
     static probe(buffer) {
-        let data = new Uint8Array(buffer);
+        const dataView = new DataView(buffer);
+
         let mismatch = {match: false};
 
-        if (data[0] !== 0x46 || data[1] !== 0x4C || data[2] !== 0x56 || data[3] !== 0x01) {
-            return mismatch;
+        const signature = dataView.getUint32(0);
+
+        if (signature != ((0x46<<24) + (0x4C<<16) + (0x56<<8) + 0x01)) {
+          return mismatch;
         }
 
-        let hasAudio = ((data[4] & 4) >>> 2) !== 0;
-        let hasVideo = (data[4] & 1) !== 0;
+        const typeFlags = dataView.getUint8(32);
+        const hasAudioTrack = (typeFlags & (1<<2)) == 1<<2;
+        const hasVideoTrack = (typeFlags & 1) == 1;
 
-        let offset = ReadBig32(data, 5);
+        const offset = dataView.getUint32(40);
 
         if (offset < 9) {
             return mismatch;
@@ -147,8 +151,8 @@ class FLVDemuxer {
             match: true,
             consumed: offset,
             dataOffset: offset,
-            hasAudioTrack: hasAudio,
-            hasVideoTrack: hasVideo
+            hasAudioTrack,
+            hasVideoTrack
         };
     }
 
